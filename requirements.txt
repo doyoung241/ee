@@ -8,3 +8,4 @@ openai>=1.30.0
 tiktoken>=0.7.0
 rapidfuzz>=3.9.6
 streamlit-oauth
+psycopg2-binary>=2.9
