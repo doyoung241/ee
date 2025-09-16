@@ -525,34 +525,76 @@ def history_view():
 # --------------------------------
 def admin_view():
     st.header("관리자 페이지")
-
     if st.button("새로고침"): st.rerun()
+
     with get_session() as db:
         users = db.query(User).order_by(User.created_at.desc()).all()
     if not users:
-        st.info("등록된 사용자가 없습니다."); return
+        st.info("등록된 사용자가 없습니다.")
+        return
 
     for u in users:
-        col1, col2, col3, col4, col5 = st.columns([3,2,2,2,2])
+        col1, col2, col3, col4, col5 = st.columns([3,1.5,2.2,3.2,2.1])
         with col1:
-            st.write(f"{u.name} · {u.email} · {u.school or '학교 미입력'}")
-        with col2: st.write(f"플랜: {u.plan}")
-        with col3: st.write(f"사용량: {u.quota_used}/{u.quota_total if u.plan=='free' else '무제한'}")
+            st.write(f"{u.name} · {u.email}")
+            st.caption(u.school or "학교 미입력")
+        with col2:
+            st.write(f"플랜: {u.plan}")
+        with col3:
+            st.write(f"사용량: {u.quota_used}/{u.quota_total if u.plan=='free' else '무제한'}")
 
+        # 승인/전환 버튼
         with col4:
-            if u.email != "admin@exam.com":
-                if u.plan == "free":
+            if u.email == "admin@exam.com":
+                st.button("관리자", key=f"admin_tag_{u.id}", disabled=True)
+            else:
+                # 가입 승인 단계
+                if u.plan == "pending":
+                    cA, cB, cC = st.columns([1,1,1])
+                    with cA:
+                        if st.button("승인 → FREE", key=f"approve_free_{u.id}"):
+                            with get_session() as db2:
+                                uu = db2.query(User).get(u.id)
+                                uu.plan = "free"; uu.quota_total = 10; uu.quota_used = 0
+                                db2.commit()
+                            st.success(f"{u.email} 승인됨 (FREE)")
+                            st.rerun()
+                    with cB:
+                        if st.button("승인 → PRO", key=f"approve_pro_{u.id}"):
+                            with get_session() as db2:
+                                uu = db2.query(User).get(u.id)
+                                uu.plan = "pro"; uu.quota_total = 9999
+                                db2.commit()
+                            st.success(f"{u.email} 승인됨 (PRO)")
+                            st.rerun()
+                    with cC:
+                        if st.button("가입 거절(삭제)", key=f"reject_{u.id}"):
+                            with get_session() as db2:
+                                # 유저 관련 데이터도 정리
+                                db2.query(Question).filter(Question.user_id==u.id).delete(synchronize_session=False)
+                                db2.query(Document).filter(Document.user_id==u.id).delete(synchronize_session=False)
+                                uu = db2.query(User).get(u.id)
+                                if uu: db2.delete(uu)
+                                db2.commit()
+                            st.success("가입 요청을 삭제했습니다.")
+                            st.rerun()
+                # 요금제 전환
+                elif u.plan == "free":
                     if st.button("FREE → PRO", key=f"to_pro_{u.id}"):
                         with get_session() as db2:
-                            uu = db2.query(User).filter(User.id==u.id).first()
-                            uu.plan="pro"; db2.commit()
+                            uu = db2.query(User).get(u.id)
+                            uu.plan = "pro"; uu.quota_total = 9999
+                            db2.commit()
                         st.rerun()
                 elif u.plan == "pro":
                     if st.button("PRO → FREE", key=f"to_free_{u.id}"):
                         with get_session() as db2:
-                            uu = db2.query(User).filter(User.id==u.id).first()
-                            uu.plan="free"; uu.quota_total=10; db2.commit()
+                            uu = db2.query(User).get(u.id)
+                            uu.plan = "free"; uu.quota_total = 10
+                            db2.commit()
                         st.rerun()
+
+        # 상세 보기(비번 포함)
         with col5:
             if st.button("상세보기", key=f"detail_{u.id}"):
                 st.session_state[f"show_detail_{u.id}"] = not st.session_state.get(f"show_detail_{u.id}", False)
