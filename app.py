@@ -1,7 +1,12 @@
 import os, json, uuid, requests
 import streamlit as st
 from dotenv import load_dotenv
-from streamlit_oauth import OAuth2Component
+
+# ⬇️ streamlit_oauth가 없거나 설치 실패해도 앱이 죽지 않도록 가드
+try:
+    from streamlit_oauth import OAuth2Component
+except Exception:
+    OAuth2Component = None
 
 from core.db import init_db, get_session, Document, Question, User
 from core.exam import (
@@ -19,6 +24,15 @@ from core.exam import (
 load_dotenv()
 st.set_page_config(page_title="AI 시험문제 생성기", page_icon="📘", layout="wide")
 init_db()
+
+# --------------------------------
+# 헬퍼 (secrets 또는 환경변수)
+# --------------------------------
+def _get_secret(k, default=None):
+    try:
+        return st.secrets.get(k, os.getenv(k, default))
+    except Exception:
+        return os.getenv(k, default)
 
 # --------------------------------
 # 세션 상태값
@@ -61,11 +75,13 @@ def login_view():
 
     # ✅ 구글 로그인
     st.subheader("구글 로그인")
-    client_id = os.getenv("GOOGLE_CLIENT_ID")
-    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-    redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8501")
+    client_id = _get_secret("GOOGLE_CLIENT_ID")
+    client_secret = _get_secret("GOOGLE_CLIENT_SECRET")
+    redirect_uri = _get_secret("OAUTH_REDIRECT_URI", "http://localhost:8501")
 
-    if client_id and client_secret:
+    can_google_login = bool(OAuth2Component and client_id and client_secret)
+
+    if can_google_login:
         oauth = OAuth2Component(
             client_id=client_id,
             client_secret=client_secret,
@@ -108,7 +124,7 @@ def login_view():
                 route_set("admin" if u.email == "admin@exam.com" else "landing")
                 st.rerun()
     else:
-        st.info("구글 OAuth Client ID/Secret이 .env에 설정되지 않았습니다.")
+        st.info("구글 로그인을 쓰려면 `streamlit-oauth` 설치 및 GOOGLE_CLIENT_ID/SECRET, OAUTH_REDIRECT_URI 시크릿(또는 .env)을 설정하세요.")
 
     st.markdown("---")
 
@@ -183,9 +199,6 @@ def landing_view():
         st.info(f"요금제: {u.plan.upper()} | 사용량: {u.quota_used}/{u.quota_total if u.plan=='free' else '무제한'}")
     if st.button("시작하기"): route_set("upload"); st.rerun()
 
-# --------------------------------
-# PDF 업로드 & 문제 생성
-# --------------------------------
 # --------------------------------
 # PDF 업로드 & 문제 생성
 # --------------------------------
@@ -293,11 +306,19 @@ def quiz_view():
                     # 메타가 혹시 비어있으면 안전하게 생성
                     if not meta.get("model_answer") or "key_points" not in meta:
                         try:
-                            mk = get_model_answer_and_keys(q.prompt_text, st.session_state["batch_context_pages"][:10], q.difficulty)
+                            mk = get_model_answer_and_keys(
+                                q.prompt_text,
+                                st.session_state["batch_context_pages"][:10],
+                                q.difficulty
+                            )
                         except Exception:
                             mk = {"model_answer": "", "key_points": []}
                         try:
-                            src = best_source_page(q.prompt_text, mk.get("model_answer",""), st.session_state["batch_context_pages"])
+                            src = best_source_page(
+                                q.prompt_text,
+                                mk.get("model_answer",""),
+                                st.session_state["batch_context_pages"]
+                            )
                         except Exception:
                             src = None
                         meta.update({
@@ -396,7 +417,7 @@ def results_view():
         route_set("history"); st.rerun()
 
 # --------------------------------
-# 이용내역 (개인)
+# 이용내역 (개인) - PDF별로 묶어서 표시/삭제
 # --------------------------------
 def history_view():
     st.header("📖 나의 이용내역 (PDF별)")
@@ -426,7 +447,6 @@ def history_view():
             with st.expander(f"📄 {doc.filename} — (문항 없음)"):
                 if st.button("이 PDF 전체 결과 삭제", key=f"del_doc_empty_{doc.id}"):
                     with get_session() as db:
-                        # 문서 삭제
                         d = db.query(Document).get(doc.id)
                         if d: db.delete(d)
                         db.commit()
@@ -499,6 +519,7 @@ def history_view():
                         else:
                             st.markdown(f"- **출처:** (정보 없음)")
                         st.markdown("---")
+
 # --------------------------------
 # 관리자 페이지
 # --------------------------------
