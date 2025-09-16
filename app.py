@@ -204,80 +204,100 @@ def landing_view():
 # --------------------------------
 def upload_view():
     st.header("PDF 업로드")
+
+    # 현재 사용자/남은 개수 확인 (표시용)
     with get_session() as db:
         u = db.query(User).get(st.session_state["user"]["id"])
-        if u.plan=="free" and u.quota_used>=u.quota_total:
-            st.error("무료 체험을 모두 사용했습니다."); return
+        if u.plan == "free":
+            remaining = max((u.quota_total or 0) - (u.quota_used or 0), 0)
+            if remaining == 0:
+                st.error("무료 체험(10문제)을 모두 사용했습니다. 관리자에게 유료 승인을 요청하세요.")
+                return
 
-    files = st.file_uploader("PDF 업로드", type=["pdf"], accept_multiple_files=True)
-    diff = st.selectbox("난이도", ["하","중","상"], 1)
-    num_q = st.slider("문항 수", 3, 20, 8)
-    q_type = st.selectbox("문제 유형", ["서술형","객관식","OX퀴즈"])
+    files = st.file_uploader("PDF 업로드 (여러 개 가능)", type=["pdf"], accept_multiple_files=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        diff = st.selectbox("난이도", ["하","중","상"], index=1)
+    with col2:
+        num_q = st.slider("문항 수", 3, 20, 8)
+
+    q_type = st.selectbox("문제 유형", ["서술형", "객관식", "OX퀴즈"], index=0)
     style = st.text_input("출제 스타일 (선택)")
 
     if st.button("문제 생성"):
-        if not files: st.error("PDF를 올려주세요"); return
+        if not files:
+            st.error("PDF를 올려주세요")
+            return
 
         with st.spinner("문제 생성 중..."):
+            # 1) 텍스트 추출은 세션 밖에서도 OK
             pages = extract_text_from_pdfs(files)
-            st.session_state["batch_context_pages"] = pages
             full_text = "\n\n".join([p["text"] for p in pages])[:15000]
 
+            # 2) 생성/저장/사용량 증가를 **같은 세션**에서 처리
             with get_session() as db:
+                # 사용자 다시 조회(이 세션에 attach)
+                uu = db.query(User).get(st.session_state["user"]["id"])
+
+                # 무료 플랜이면 남은 수로 제한
+                if uu.plan == "free":
+                    remaining = max((uu.quota_total or 0) - (uu.quota_used or 0), 0)
+                    if remaining <= 0:
+                        st.error("남은 문제가 없습니다.")
+                        return
+                    if num_q > remaining:
+                        st.warning(f"무료 플랜 잔여 {remaining}문제만 생성됩니다.")
+                        num_q = remaining
+
+                # 문서 저장
                 doc = Document(
-                    user_id=st.session_state["user"]["id"],
+                    user_id=uu.id,
                     filename=", ".join([f.name for f in files]),
                     text_preview=full_text[:800],
                     full_text=full_text
                 )
                 db.add(doc); db.commit(); db.refresh(doc)
 
-                # ✅ 문제 생성
-                qs = generate_questions(full_text, num_q, diff, style, [], q_type)
+                # 문제 생성
+                qs = generate_questions(
+                    full_text,
+                    num_questions=num_q,
+                    difficulty=diff,
+                    style=style,
+                    prev_questions=[],   # 필요하면 중복방지용으로 doc.id 기준 과거문항 조회해서 넣으세요
+                    q_type=q_type
+                )
 
-                # ✅ 배치 ID 부여
+                # 배치 ID
                 batch_id = str(uuid.uuid4())[:8]
                 st.session_state["current_batch_id"] = batch_id
+                st.session_state["batch_context_pages"] = pages
 
-                # ✅ 각 문제에 대해 '모범답안/키워드/출처'를 미리 생성해서 meta_json에 저장
+                # 문제 저장 (여기선 모범답안/키워드/출처는 따로 계산 안 해도 OK — 이미 결과 뷰에서 처리)
                 q_ids = []
                 for qtext in qs:
-                    try:
-                        mk = get_model_answer_and_keys(qtext, pages[:10], diff)
-                    except Exception:
-                        mk = {"model_answer": "", "key_points": []}
-
-                    try:
-                        src = best_source_page(qtext, mk.get("model_answer",""), pages)
-                    except Exception:
-                        src = None
-
-                    meta = {
-                        "batch_id": batch_id,
-                        "model_answer": mk.get("model_answer",""),
-                        "key_points": mk.get("key_points", []),
-                        "source": src
-                    }
-
                     row = Question(
-                        user_id=doc.user_id,
+                        user_id=uu.id,
                         document_id=doc.id,
                         prompt_text=qtext,
                         difficulty=diff,
                         kind=q_type,
-                        meta_json=json.dumps(meta, ensure_ascii=False)
+                        meta_json=json.dumps({"batch_id": batch_id}, ensure_ascii=False)
                     )
                     db.add(row); db.commit(); db.refresh(row)
                     q_ids.append(row.id)
 
-                # ✅ 무료 플랜 사용량 증가
-                if u.plan=="free":
-                    u.quota_used += len(q_ids)
+                # ★ 무료 플랜 사용량 증가 — 반드시 같은 세션의 uu로!
+                if uu.plan == "free":
+                    uu.quota_used = (uu.quota_used or 0) + len(q_ids)
                     db.commit()
+                    # 상단 표시 즉시 반영
+                    st.session_state["user"]["quota_used"] = uu.quota_used
 
             st.session_state["current_q_ids"] = q_ids
+            st.session_state["answers"] = {qid: "" for qid in q_ids}
             route_set("quiz"); st.rerun()
-
 # --------------------------------
 # 문제 풀이 + 챗봇
 # --------------------------------
