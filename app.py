@@ -8,7 +8,14 @@ try:
 except Exception:
     OAuth2Component = None
 
-from core.db import init_db, get_session, Document, Question, User
+# ⬇️ test_db_connection이 없는 core/db.py와도 호환되게 try-import
+try:
+    from core.db import init_db, get_session, Document, Question, User, test_db_connection
+except Exception:
+    from core.db import init_db, get_session, Document, Question, User
+    def test_db_connection():
+        return True, "SKIP"
+
 from core.exam import (
     extract_text_from_pdfs,
     generate_questions,
@@ -23,6 +30,20 @@ from core.exam import (
 # --------------------------------
 load_dotenv()
 st.set_page_config(page_title="AI 시험문제 생성기", page_icon="📘", layout="wide")
+
+# ✅ DB 연결 점검 후 초기화 (외부 DB 사용 시 문제 원인을 화면에서 바로 확인)
+ok, msg = test_db_connection()
+if not ok:
+    st.error(
+        "❌ 데이터베이스 연결에 실패했습니다.\n\n"
+        "확인해보세요:\n"
+        "• Streamlit Secrets에 DATABASE_URL 정확히 입력(또는 로컬 SQLite 사용)\n"
+        "• postgresql+psycopg2 접두사 / sslmode=require 여부\n"
+        "• 사용자/비밀번호/호스트/포트/DB명\n\n"
+        f"(내부 메시지 요약: {msg})"
+    )
+    st.stop()
+
 init_db()
 
 # --------------------------------
@@ -200,7 +221,7 @@ def landing_view():
     if st.button("시작하기"): route_set("upload"); st.rerun()
 
 # --------------------------------
-# PDF 업로드 & 문제 생성
+# PDF 업로드 & 문제 생성 (모범답안/키워드/출처 미리 저장)
 # --------------------------------
 def upload_view():
     st.header("PDF 업로드")
@@ -231,13 +252,12 @@ def upload_view():
             return
 
         with st.spinner("문제 생성 중..."):
-            # 1) 텍스트 추출은 세션 밖에서도 OK
+            # 1) 텍스트 추출
             pages = extract_text_from_pdfs(files)
             full_text = "\n\n".join([p["text"] for p in pages])[:15000]
 
-            # 2) 생성/저장/사용량 증가를 **같은 세션**에서 처리
+            # 2) 생성/저장/사용량 증가를 같은 세션에서 처리
             with get_session() as db:
-                # 사용자 다시 조회(이 세션에 attach)
                 uu = db.query(User).get(st.session_state["user"]["id"])
 
                 # 무료 플랜이면 남은 수로 제한
@@ -265,7 +285,7 @@ def upload_view():
                     num_questions=num_q,
                     difficulty=diff,
                     style=style,
-                    prev_questions=[],   # 필요하면 중복방지용으로 doc.id 기준 과거문항 조회해서 넣으세요
+                    prev_questions=[],   # 필요시 doc.id 기준 과거문항 조회 넣으세요
                     q_type=q_type
                 )
 
@@ -274,30 +294,46 @@ def upload_view():
                 st.session_state["current_batch_id"] = batch_id
                 st.session_state["batch_context_pages"] = pages
 
-                # 문제 저장 (여기선 모범답안/키워드/출처는 따로 계산 안 해도 OK — 이미 결과 뷰에서 처리)
+                # ⬇️ 각 문항의 모범답안/키워드/출처를 **미리** 계산해 meta_json에 저장
                 q_ids = []
                 for qtext in qs:
+                    try:
+                        mk = get_model_answer_and_keys(qtext, pages[:10], diff)
+                    except Exception:
+                        mk = {"model_answer": "", "key_points": []}
+                    try:
+                        src = best_source_page(qtext, mk.get("model_answer", ""), pages)
+                    except Exception:
+                        src = None
+
+                    meta = {
+                        "batch_id": batch_id,
+                        "model_answer": mk.get("model_answer", ""),
+                        "key_points": mk.get("key_points", []),
+                        "source": src
+                    }
+
                     row = Question(
                         user_id=uu.id,
                         document_id=doc.id,
                         prompt_text=qtext,
                         difficulty=diff,
                         kind=q_type,
-                        meta_json=json.dumps({"batch_id": batch_id}, ensure_ascii=False)
+                        meta_json=json.dumps(meta, ensure_ascii=False)
                     )
                     db.add(row); db.commit(); db.refresh(row)
                     q_ids.append(row.id)
 
-                # ★ 무료 플랜 사용량 증가 — 반드시 같은 세션의 uu로!
+                # ★ 무료 플랜 사용량 증가 — 같은 세션에서!
                 if uu.plan == "free":
                     uu.quota_used = (uu.quota_used or 0) + len(q_ids)
                     db.commit()
-                    # 상단 표시 즉시 반영
                     st.session_state["user"]["quota_used"] = uu.quota_used
 
             st.session_state["current_q_ids"] = q_ids
             st.session_state["answers"] = {qid: "" for qid in q_ids}
             route_set("quiz"); st.rerun()
+
 # --------------------------------
 # 문제 풀이 + 챗봇
 # --------------------------------
@@ -308,7 +344,6 @@ def quiz_view():
             Question.id.in_(st.session_state["current_q_ids"])
         ).all()
 
-    # 입력 UI
     for idx, q in enumerate(qrows, 1):
         st.subheader(f"Q{idx}. {q.prompt_text}")
         st.session_state["answers"][q.id] = st.text_area(
@@ -323,7 +358,7 @@ def quiz_view():
                 for q in qrows:
                     meta = json.loads(q.meta_json or "{}")
 
-                    # 메타가 혹시 비어있으면 안전하게 생성
+                    # 업로드 때 이미 meta 저장해놨지만, 혹시 비어있으면 안전하게 보완
                     if not meta.get("model_answer") or "key_points" not in meta:
                         try:
                             mk = get_model_answer_and_keys(
@@ -385,7 +420,6 @@ def results_view():
         key_points = meta.get("key_points", [])
         src = meta.get("source") or {}
 
-        # 점수 None 방지
         score_val = q.score if q.score is not None else 0
 
         st.subheader(f"문제 {idx}")
@@ -444,7 +478,6 @@ def history_view():
 
     user_id = st.session_state["user"]["id"]
     with get_session() as db:
-        # 내가 업로드한 문서들 (최근 업로드 순)
         docs = db.query(Document)\
                  .filter(Document.user_id == user_id)\
                  .order_by(Document.created_at.desc())\
@@ -455,7 +488,6 @@ def history_view():
         return
 
     for doc in docs:
-        # 이 문서에 속한 모든 문제 가져오기 (생성 순)
         with get_session() as db:
             qrows = db.query(Question)\
                       .filter(Question.document_id == doc.id)\
@@ -463,7 +495,6 @@ def history_view():
                       .all()
 
         if not qrows:
-            # 문제 없으면 문서만 남아있을 수 있으니 삭제 버튼만 제공
             with st.expander(f"📄 {doc.filename} — (문항 없음)"):
                 if st.button("이 PDF 전체 결과 삭제", key=f"del_doc_empty_{doc.id}"):
                     with get_session() as db:
@@ -486,16 +517,13 @@ def history_view():
         title = f"📄 {doc.filename} — {len(qrows)}문항 · 평균 {avg_doc:.1f}/10"
 
         with st.expander(title, expanded=False):
-            # 문서 전체 삭제 버튼
             colA, colB = st.columns([1,4])
             with colA:
                 if st.button("이 PDF 전체 결과 삭제", key=f"del_doc_{doc.id}"):
                     with get_session() as db:
-                        # 해당 문서의 모든 문제 삭제
                         db.query(Question)\
                           .filter(Question.document_id == doc.id)\
                           .delete(synchronize_session=False)
-                        # 문서 삭제
                         d = db.query(Document).get(doc.id)
                         if d: db.delete(d)
                         db.commit()
@@ -505,12 +533,11 @@ def history_view():
 
             st.markdown("---")
 
-            # 세트별(배치)로 상세 표시
+            # 세트별(배치) 상세
             for bid, qs in batches.items():
                 batch_scores = [(qq.score if qq.score is not None else 0) for qq in qs]
                 avg_batch = sum(batch_scores) / len(batch_scores) if batch_scores else 0.0
                 with st.expander(f"🗂 세트 {bid} — {len(qs)}문항 · 평균 {avg_batch:.1f}/10", expanded=False):
-                    # 세트 삭제 버튼
                     if st.button("이 세트 삭제", key=f"del_batch_{doc.id}_{bid}"):
                         ids = [qq.id for qq in qs]
                         with get_session() as db:
@@ -520,13 +547,11 @@ def history_view():
                             db.commit()
                         st.success("세트가 삭제되었습니다."); st.rerun()
 
-                    # 문제들 나열
                     for idx, q in enumerate(qs, 1):
                         meta = json.loads(q.meta_json or "{}")
                         model_answer = meta.get("model_answer", "")
                         key_points = meta.get("key_points", [])
                         src = meta.get("source") or {}
-
                         score_val = q.score if q.score is not None else 0
 
                         st.markdown(f"**문제 {idx}.** {q.prompt_text}")
@@ -563,12 +588,10 @@ def admin_view():
         with col3:
             st.write(f"사용량: {u.quota_used}/{u.quota_total if u.plan=='free' else '무제한'}")
 
-        # 승인/전환 버튼
         with col4:
             if u.email == "admin@exam.com":
                 st.button("관리자", key=f"admin_tag_{u.id}", disabled=True)
             else:
-                # 가입 승인 단계
                 if u.plan == "pending":
                     cA, cB, cC = st.columns([1,1,1])
                     with cA:
@@ -590,7 +613,6 @@ def admin_view():
                     with cC:
                         if st.button("가입 거절(삭제)", key=f"reject_{u.id}"):
                             with get_session() as db2:
-                                # 유저 관련 데이터도 정리
                                 db2.query(Question).filter(Question.user_id==u.id).delete(synchronize_session=False)
                                 db2.query(Document).filter(Document.user_id==u.id).delete(synchronize_session=False)
                                 uu = db2.query(User).get(u.id)
@@ -598,7 +620,6 @@ def admin_view():
                                 db2.commit()
                             st.success("가입 요청을 삭제했습니다.")
                             st.rerun()
-                # 요금제 전환
                 elif u.plan == "free":
                     if st.button("FREE → PRO", key=f"to_pro_{u.id}"):
                         with get_session() as db2:
@@ -614,7 +635,6 @@ def admin_view():
                             db2.commit()
                         st.rerun()
 
-        # 상세 보기(비번 포함)
         with col5:
             if st.button("상세보기", key=f"detail_{u.id}"):
                 st.session_state[f"show_detail_{u.id}"] = not st.session_state.get(f"show_detail_{u.id}", False)
