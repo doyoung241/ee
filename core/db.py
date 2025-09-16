@@ -1,127 +1,108 @@
-# core/db.py
 import os
 from datetime import datetime
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, DateTime,
-    ForeignKey, Float
-)
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# -------------------------------
-# DB 설정
-#  - 로컬: SQLite (DB_PATH)
-#  - 배포: Postgres (DATABASE_URL) -> 예: postgresql+psycopg2://user:pass@host:5432/db
-# -------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# 우선순위: 외부 DB(DATABASE_URL) → 없으면 SQLite(DB_PATH)
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "./data/db/app.db")
 
+def _force_psycopg2_and_ssl(url: str) -> str:
+    if not url:
+        return url
+    # 드라이버 접두사 보정
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://") and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    # sslmode=require 강제
+    if "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
+
 if DATABASE_URL:
-    # 외부(Postgres 등)
+    DATABASE_URL = _force_psycopg2_and_ssl(DATABASE_URL)
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
-        pool_recycle=1800,
-        future=True,
+        pool_recycle=300,
+        echo=False,
     )
 else:
-    # 로컬(SQLite)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     engine = create_engine(
         f"sqlite:///{DB_PATH}",
         connect_args={"check_same_thread": False},
-        future=True,
+        echo=False,
     )
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 # -------------------------------
-# User 모델 (회원)
+# Models
 # -------------------------------
 class User(Base):
     __tablename__ = "users"
-
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(255), unique=True, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     school = Column(String(255), nullable=True)
     password_hash = Column(String(255), nullable=False)
-
     plan = Column(String(20), default="pending")   # pending / free / pro
     quota_total = Column(Integer, default=10)
     quota_used = Column(Integer, default=0)
-
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    # 유저 삭제 시 문서/문항도 함께 삭제되도록 cascade 설정
-    documents = relationship(
-        "Document",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    questions = relationship(
-        "Question",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+    documents = relationship("Document", back_populates="user")
+    questions = relationship("Question", back_populates="user")
 
-# -------------------------------
-# Document 모델
-# -------------------------------
 class Document(Base):
     __tablename__ = "documents"
-
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     filename = Column(String(255), nullable=False)
     text_preview = Column(Text, nullable=True)
     full_text = Column(Text, nullable=True)
-
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="documents")
-    questions = relationship(
-        "Question",
-        back_populates="document",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+    questions = relationship("Question", back_populates="document")
 
-# -------------------------------
-# Question 모델
-# -------------------------------
 class Question(Base):
     __tablename__ = "questions"
-
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=True)
-
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)
     prompt_text = Column(Text, nullable=True)
     answer_text = Column(Text, nullable=True)
     kind = Column(String(50), default="서술형")
     difficulty = Column(String(10), default="중")
     score = Column(Float, nullable=True)
-    meta_json = Column(Text, nullable=True)  # batch_id / model_answer / key_points / source 저장
-
+    meta_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="questions")
     document = relationship("Document", back_populates="questions")
 
 # -------------------------------
-# DB 초기화 / 세션
+# Helpers
 # -------------------------------
 def init_db():
     Base.metadata.create_all(bind=engine)
 
 def get_session():
-    # SQLAlchemy Session은 context manager를 지원하므로
-    # `with get_session() as db:` 형태로 사용 가능
     return SessionLocal()
+
+def test_db_connection():
+    """연결 미리 점검해서 에러를 표면화(디버깅용)."""
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        return True, "OK"
+    except Exception as e:
+        # 이 메시지는 Streamlit Cloud 로그(Manage app → Logs)에서 그대로 볼 수 있음
+        return False, f"{type(e).__name__}: {e}"
